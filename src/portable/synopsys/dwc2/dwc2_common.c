@@ -45,31 +45,16 @@ static void reset_core(dwc2_regs_t *dwc2) {
     }
   }
 
-  // On DWC2 cores synthesised with a ULPI HS PHY (GHWCFG2.hs_phy_type == ULPI)
-  // but operated in FS-only mode (GUSBCFG.PHYSEL=1, no external ULPI PHY present),
-  // CSRST resets BOTH the FS clock domain (48 MHz) AND the HS/ULPI clock domain
-  // (normally 60 MHz from the external ULPI PHY).  The FS domain completes in
-  // ~0.33 µs, but the HS domain requires the external ULPI clock which is absent.
+  // NOTE (STM32H723ZG / DWC2 ULPI+DedicatedFS in FS mode):
+  // CSRST resets both the FS clock domain (48 MHz) and the ULPI clock domain.
+  // When the ULPI interface module clock gate (RCC AHB1ENR bit26, USB1OTGHSULPIEN)
+  // is LEFT DISABLED, the ULPI domain is RCC-gated and DWC2 does not wait for it.
+  // CSRST then completes in ~10 µs using only the 48 MHz FS clock.
   //
-  // CSRST therefore never self-clears, and the hardware latches it high — writing
-  // GRSTCTL.CSRST=0 is also silently ignored while the reset is in-flight.
-  // While CSRST=1 the hardware continuously overrides GAHBCFG, GINTMSK, DCFG and
-  // DCTL back to their reset defaults, so no register writes in this domain take
-  // effect.  This makes it impossible to configure the USB device controller.
-  //
-  // Solution: skip CSRST entirely when GHWCFG2.hs_phy_type == ULPI and
-  // GUSBCFG.PHYSEL == 1.  The peripheral is already in a clean reset state because
-  // the board init performs a full RCC peripheral reset (AHB1RSTR) before calling
-  // tusb_init() — an RCC reset is a strict superset of what CSRST achieves for the
-  // FS domain.  PHYSEL=1 guarantees the ULPI domain is powered-down and irrelevant.
-  // Other platforms are unaffected: those with a real ULPI PHY set PHYSEL=0 and
-  // take the normal CSRST path; those without a ULPI HS PHY also take the normal path.
-  {
-    const dwc2_ghwcfg2_t ghwcfg2 = {.value = dwc2->ghwcfg2};
-    if (ghwcfg2.hs_phy_type == GHWCFG2_HSPHY_ULPI && (dwc2->gusbcfg & GUSBCFG_PHYSEL)) {
-      return; // skip CSRST: already RCC-reset; ULPI clock domain unavailable
-    }
-  }
+  // IMPORTANT: Do NOT enable RCC AHB1ENR bit26 when using PHYSEL=1 without an
+  // external ULPI PHY.  With bit26 enabled, the ULPI domain becomes "active" from
+  // the RCC's perspective, CSRST hangs waiting for the absent 60 MHz ULPI clock,
+  // and the hardware continuously overrides DCFG/DCTL/GINTMSK — USB cannot work.
 
   const uint32_t gsnpsid = dwc2->gsnpsid; // preload gsnpsid which is not readable while resetting
   dwc2->grstctl |= GRSTCTL_CSRST;         // reset core
@@ -113,6 +98,15 @@ static void phy_fs_init(dwc2_regs_t *dwc2) {
   // Select FS PHY
   gusbcfg |= GUSBCFG_PHYSEL;
   dwc2->gusbcfg = gusbcfg;
+
+  // Wait for the 48 MHz FS PHY clock to stabilise after PHYSEL switches the clock
+  // path from the ULPI domain to the embedded-FS-PHY domain.  Prior to PHYSEL=1 the
+  // DWC2 ran on the ULPI_CLK input (absent when no external ULPI PHY is fitted), so
+  // the PHY clock domain had no clock at all.  After PHYSEL=1 the RCC routes HSI48 →
+  // USB48 domain → DWC2.  Per DWC2 Programming Guide §2.5.1, software must allow the
+  // new clock to be stable before accessing PHY-clock-domain registers.  On STM32H7x3
+  // without a ULPI PHY (e.g. Nucleo H723ZG CN13), a ~1 ms spin-wait is sufficient.
+  for (volatile uint32_t physel_settle = 0u; physel_settle < 25000u; physel_settle++) {}
 
   // MCU specific PHY init before reset
   dwc2_phy_init(dwc2, GHWCFG2_HSPHY_NOT_SUPPORTED);
@@ -272,8 +266,22 @@ bool dwc2_core_init(uint8_t rhport, bool is_hs_phy, bool is_dma) {
   // Enable PHY clock TODO stop/gate clock when suspended mode
   dwc2->pcgcctl &= ~(PCGCCTL_STOPPCLK | PCGCCTL_GATEHCLK | PCGCCTL_PWRCLMP | PCGCCTL_RSTPDWNMODULE);
 
-  dfifo_flush_tx(dwc2, 0x10); // all tx fifo
-  dfifo_flush_rx(dwc2);
+  // On DWC2 cores synthesised with ULPI HS PHY (GHWCFG2.hs_phy_type == ULPI) but
+  // operated in FS mode (GUSBCFG.PHYSEL=1, no external ULPI PHY fitted), the FIFO
+  // flush operations (GRSTCTL.TXFFLSH / RXFFLSH) also require the ULPI clock domain
+  // and never self-clear on this synthesis when the ULPI clock is absent.  After an
+  // RCC peripheral hard-reset the DWC2 FIFOs are in their power-on state (empty),
+  // so no flush is needed.  Skip for this specific configuration only.
+  {
+    const dwc2_ghwcfg2_t ghwcfg2_ci = {.value = dwc2->ghwcfg2};
+    const bool skip_flush = (ghwcfg2_ci.hs_phy_type == GHWCFG2_HSPHY_ULPI && !!(dwc2->gusbcfg & GUSBCFG_PHYSEL));
+    if (!skip_flush) {
+      // Short settling delay so the 48 MHz FS PHY clock is stable before flush.
+      for (volatile uint32_t d = 0u; d < 10000u; d++) {}
+      dfifo_flush_tx(dwc2, 0x10); // all tx fifo
+      dfifo_flush_rx(dwc2);
+    }
+  }
 
   // Clear pending and disable all interrupts
   dwc2->gintsts = 0xFFFFFFFFU;

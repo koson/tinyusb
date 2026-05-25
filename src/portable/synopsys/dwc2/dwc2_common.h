@@ -1,5 +1,5 @@
 /*
-* The MIT License (MIT)
+ * The MIT License (MIT)
  *
  * Copyright (c) 2024 Ha Thach (tinyusb.org)
  *
@@ -31,11 +31,11 @@
 #include "dwc2_type.h"
 
 #if CFG_TUD_ENABLED
-#include "device/dcd.h"
+  #include "device/dcd.h"
 #endif
 
 #if CFG_TUH_ENABLED
-#include "host/hcd.h"
+  #include "host/hcd.h"
 #endif
 
 /* Following symbols must be defined by port header
@@ -79,16 +79,16 @@ enum {
 //--------------------------------------------------------------------+
 // Core/Controller
 //--------------------------------------------------------------------+
-TU_ATTR_ALWAYS_INLINE static inline dwc2_regs_t* DWC2_REG(uint8_t rhport) {
+TU_ATTR_ALWAYS_INLINE static inline dwc2_regs_t *DWC2_REG(uint8_t rhport) {
   if (rhport >= DWC2_CONTROLLER_COUNT) {
     // user mis-configured, ignore and use first controller
     rhport = 0;
   }
-  return (dwc2_regs_t*)_dwc2_controller[rhport].reg_base;
+  return (dwc2_regs_t *)_dwc2_controller[rhport].reg_base;
 }
 
 // check if highspeed phy should be used
-bool dwc2_core_is_highspeed_phy(dwc2_regs_t* dwc2, bool prefer_hs_phy);
+bool dwc2_core_is_highspeed_phy(dwc2_regs_t *dwc2, bool prefer_hs_phy);
 bool dwc2_core_init(uint8_t rhport, bool is_hs_phy, bool is_dma);
 void dwc2_core_deinit(uint8_t rhport);
 void dwc2_core_handle_common_irq(uint8_t rhport, bool in_isr);
@@ -96,20 +96,35 @@ void dwc2_core_handle_common_irq(uint8_t rhport, bool in_isr);
 //--------------------------------------------------------------------+
 // DFIFO
 //--------------------------------------------------------------------+
-TU_ATTR_ALWAYS_INLINE static inline void dfifo_flush_tx(dwc2_regs_t* dwc2, uint8_t fnum) {
+TU_ATTR_ALWAYS_INLINE static inline void dfifo_flush_tx(dwc2_regs_t *dwc2, uint8_t fnum) {
   // flush TX fifo and wait for it cleared
-  dwc2->grstctl = GRSTCTL_TXFFLSH | (fnum << GRSTCTL_TXFNUM_Pos);
-  while (0 != (dwc2->grstctl & GRSTCTL_TXFFLSH_Msk)) {}
+  // Use a timeout: on DWC2 cores with a ULPI HS PHY operating in FS-only mode
+  // (e.g. STM32H723ZG USB1_OTG_HS with PHYSEL=1), the flush-done acknowledge
+  // requires the 48 MHz PHY clock.  If the clock is not yet stable the bit
+  // never clears.  The STM32 HAL uses a 200 000-count timeout for the same
+  // reason (see USB_FlushTxFifo in stm32h7xx_ll_usb.c).
+  dwc2->grstctl           = GRSTCTL_TXFFLSH | (fnum << GRSTCTL_TXFNUM_Pos);
+  volatile uint32_t count = 0u;
+  while (0 != (dwc2->grstctl & GRSTCTL_TXFFLSH_Msk)) {
+    if (++count > 200000u) {
+      break;
+    }
+  }
 }
 
-TU_ATTR_ALWAYS_INLINE static inline void dfifo_flush_rx(dwc2_regs_t* dwc2) {
-  // flush RX fifo and wait for it cleared
-  dwc2->grstctl = GRSTCTL_RXFFLSH;
-  while (0 != (dwc2->grstctl & GRSTCTL_RXFFLSH_Msk)) {}
+TU_ATTR_ALWAYS_INLINE static inline void dfifo_flush_rx(dwc2_regs_t *dwc2) {
+  // flush RX fifo and wait for it cleared (with timeout, same reason as TX flush)
+  dwc2->grstctl           = GRSTCTL_RXFFLSH;
+  volatile uint32_t count = 0u;
+  while (0 != (dwc2->grstctl & GRSTCTL_RXFFLSH_Msk)) {
+    if (++count > 200000u) {
+      break;
+    }
+  }
 }
 
-void dfifo_read_packet(dwc2_regs_t* dwc2, uint8_t* dst, uint16_t len);
-void dfifo_write_packet(dwc2_regs_t* dwc2, uint8_t fifo_num, uint8_t const* src, uint16_t len);
+void dfifo_read_packet(dwc2_regs_t *dwc2, uint8_t *dst, uint16_t len);
+void dfifo_write_packet(dwc2_regs_t *dwc2, uint8_t fifo_num, const uint8_t *src, uint16_t len);
 
 //--------------------------------------------------------------------+
 // DMA
