@@ -26,39 +26,86 @@
 
 #include "tusb_option.h"
 
-#define DWC2_COMMON_DEBUG   2
+#define DWC2_COMMON_DEBUG 2
 
 #if defined(TUP_USBIP_DWC2) && (CFG_TUH_ENABLED || CFG_TUD_ENABLED)
-#include "dwc2_common.h"
+  #include "dwc2_common.h"
 
 //--------------------------------------------------------------------
 //
 //--------------------------------------------------------------------
-static void reset_core(dwc2_regs_t* dwc2) {
+static void reset_core(dwc2_regs_t *dwc2) {
   // The software must check that bit 31 in this register is set to 1 (AHB Master is Idle) before starting any operation
+  volatile uint32_t count;
+
+  count = 0u;
   while (!(dwc2->grstctl & GRSTCTL_AHBIDL)) {
+    if (++count > 200000u) {
+      break;
+    }
+  }
+
+  // On DWC2 cores synthesised with a ULPI HS PHY (GHWCFG2.hs_phy_type == ULPI)
+  // but operated in FS-only mode (GUSBCFG.PHYSEL=1, no external ULPI PHY present),
+  // CSRST resets BOTH the FS clock domain (48 MHz) AND the HS/ULPI clock domain
+  // (normally 60 MHz from the external ULPI PHY).  The FS domain completes in
+  // ~0.33 µs, but the HS domain requires the external ULPI clock which is absent.
+  //
+  // CSRST therefore never self-clears, and the hardware latches it high — writing
+  // GRSTCTL.CSRST=0 is also silently ignored while the reset is in-flight.
+  // While CSRST=1 the hardware continuously overrides GAHBCFG, GINTMSK, DCFG and
+  // DCTL back to their reset defaults, so no register writes in this domain take
+  // effect.  This makes it impossible to configure the USB device controller.
+  //
+  // Solution: skip CSRST entirely when GHWCFG2.hs_phy_type == ULPI and
+  // GUSBCFG.PHYSEL == 1.  The peripheral is already in a clean reset state because
+  // the board init performs a full RCC peripheral reset (AHB1RSTR) before calling
+  // tusb_init() — an RCC reset is a strict superset of what CSRST achieves for the
+  // FS domain.  PHYSEL=1 guarantees the ULPI domain is powered-down and irrelevant.
+  // Other platforms are unaffected: those with a real ULPI PHY set PHYSEL=0 and
+  // take the normal CSRST path; those without a ULPI HS PHY also take the normal path.
+  {
+    const dwc2_ghwcfg2_t ghwcfg2 = {.value = dwc2->ghwcfg2};
+    if (ghwcfg2.hs_phy_type == GHWCFG2_HSPHY_ULPI && (dwc2->gusbcfg & GUSBCFG_PHYSEL)) {
+      return; // skip CSRST: already RCC-reset; ULPI clock domain unavailable
+    }
   }
 
   const uint32_t gsnpsid = dwc2->gsnpsid; // preload gsnpsid which is not readable while resetting
-  dwc2->grstctl |= GRSTCTL_CSRST; // reset core
+  dwc2->grstctl |= GRSTCTL_CSRST;         // reset core
 
   if ((gsnpsid & DWC2_CORE_REV_MASK) < (DWC2_CORE_REV_4_20a & DWC2_CORE_REV_MASK)) {
     // prior v4.20a: CSRST is self-clearing, and the core clears this bit after all the necessary logic is reset in
     // the core, which can take several clocks, depending on the current state of the core. Once this bit has been
     // cleared, the software must wait at least 3 PHY clocks before accessing the PHY domain (synchronization delay).
-    while (dwc2->grstctl & GRSTCTL_CSRST) {}
+    count = 0u;
+    while (dwc2->grstctl & GRSTCTL_CSRST) {
+      if (++count > 200000u) {
+        break; // timeout: needed on cores with ULPI HS PHY but no external ULPI device (fallback)
+      }
+    }
   } else {
     // From v4.20a: CSRST bit is write only. The application must clear this bit after checking the bit 29 of this
     // register i.e Core Soft Reset Done CSRT_DONE (w1c)
-    while (!(dwc2->grstctl & GRSTCTL_CSRST_DONE)) {}
+    count = 0u;
+    while (!(dwc2->grstctl & GRSTCTL_CSRST_DONE)) {
+      if (++count > 200000u) {
+        break;
+      }
+    }
     dwc2->grstctl = (dwc2->grstctl & ~GRSTCTL_CSRST) | GRSTCTL_CSRST_DONE;
   }
 
-  while (!(dwc2->grstctl & GRSTCTL_AHBIDL)) {} // wait for AHB master IDLE
+  count = 0u;
+  while (!(dwc2->grstctl & GRSTCTL_AHBIDL)) {
+    if (++count > 200000u) {
+      break;
+    }
+  }
 }
 
 // Dedicated FS PHY is internal with a clock 48Mhz.
-static void phy_fs_init(dwc2_regs_t* dwc2) {
+static void phy_fs_init(dwc2_regs_t *dwc2) {
   TU_LOG(DWC2_COMMON_DEBUG, "Fullspeed PHY init\r\n");
 
   uint32_t gusbcfg = dwc2->gusbcfg;
@@ -90,17 +137,17 @@ static void phy_fs_init(dwc2_regs_t* dwc2) {
  *
  * In addition, UTMI+/ULPI can be shared to run at fullspeed mode with 48Mhz
  */
-static void phy_hs_init(dwc2_regs_t* dwc2) {
-  uint32_t gusbcfg = dwc2->gusbcfg;
+static void phy_hs_init(dwc2_regs_t *dwc2) {
+  uint32_t             gusbcfg = dwc2->gusbcfg;
   const dwc2_ghwcfg2_t ghwcfg2 = {.value = dwc2->ghwcfg2};
   const dwc2_ghwcfg4_t ghwcfg4 = {.value = dwc2->ghwcfg4};
 
   uint8_t phy_width;
   if (CFG_TUSB_MCU != OPT_MCU_AT32F402_405 && // at32f402_405 does not support 16-bit
       ghwcfg4.phy_data_width) {
-    phy_width = 16; // 16-bit PHY interface if supported
+    phy_width = 16;                           // 16-bit PHY interface if supported
   } else {
-    phy_width = 8; // 8-bit PHY interface
+    phy_width = 8;                            // 8-bit PHY interface
   }
 
   // De-select FS PHY
@@ -157,25 +204,27 @@ static void phy_hs_init(dwc2_regs_t* dwc2) {
   dwc2_phy_update(dwc2, ghwcfg2.hs_phy_type);
 }
 
-static bool check_dwc2(dwc2_regs_t* dwc2) {
-#if CFG_TUSB_DEBUG >= DWC2_COMMON_DEBUG
+static bool check_dwc2(dwc2_regs_t *dwc2) {
+  #if CFG_TUSB_DEBUG >= DWC2_COMMON_DEBUG
   // print guid, gsnpsid, ghwcfg1, ghwcfg2, ghwcfg3, ghwcfg4
   // Run 'python dwc2_info.py' and check dwc2_info.md for bit-field value and comparison with other ports
-  volatile uint32_t const* p = (volatile uint32_t const*) &dwc2->guid;
+  const volatile uint32_t *p = (const volatile uint32_t *)&dwc2->guid;
   TU_LOG1("guid, gsnpsid, ghwcfg1, ghwcfg2, ghwcfg3, ghwcfg4\r\n");
   for (size_t i = 0; i < 5; i++) {
     TU_LOG1("0x%08" PRIX32 ", ", p[i]);
   }
   TU_LOG1("0x%08" PRIX32 "\r\n", p[5]);
-#endif
+  #endif
 
   // For some reason: GD32VF103 gsnpsid and all hwcfg register are always zero (skip it)
   (void)dwc2;
-#if !TU_CHECK_MCU(OPT_MCU_GD32VF103)
-  enum { GSNPSID_ID_MASK = TU_GENMASK(31, 16) };
+  #if !TU_CHECK_MCU(OPT_MCU_GD32VF103)
+  enum {
+    GSNPSID_ID_MASK = TU_GENMASK(31, 16)
+  };
   const uint32_t gsnpsid = dwc2->gsnpsid & GSNPSID_ID_MASK;
   TU_ASSERT(gsnpsid == DWC2_OTG_ID || gsnpsid == DWC2_FS_IOT_ID || gsnpsid == DWC2_HS_IOT_ID);
-#endif
+  #endif
 
   return true;
 }
@@ -183,7 +232,7 @@ static bool check_dwc2(dwc2_regs_t* dwc2) {
 //--------------------------------------------------------------------
 //
 //--------------------------------------------------------------------
-bool dwc2_core_is_highspeed_phy(dwc2_regs_t* dwc2, bool prefer_hs_phy) {
+bool dwc2_core_is_highspeed_phy(dwc2_regs_t *dwc2, bool prefer_hs_phy) {
   const dwc2_ghwcfg2_t ghwcfg2    = {.value = dwc2->ghwcfg2};
   const bool           has_hs_phy = (ghwcfg2.hs_phy_type != GHWCFG2_HSPHY_NOT_SUPPORTED);
 
@@ -197,7 +246,7 @@ bool dwc2_core_is_highspeed_phy(dwc2_regs_t* dwc2, bool prefer_hs_phy) {
 }
 
 bool dwc2_core_init(uint8_t rhport, bool is_hs_phy, bool is_dma) {
-  dwc2_regs_t* dwc2 = DWC2_REG(rhport);
+  dwc2_regs_t *dwc2 = DWC2_REG(rhport);
 
   // Check Synopsys ID register, failed if controller clock/power is not enabled
   TU_ASSERT(check_dwc2(dwc2));
@@ -244,7 +293,7 @@ bool dwc2_core_init(uint8_t rhport, bool is_hs_phy, bool is_dma) {
 }
 
 void dwc2_core_deinit(uint8_t rhport) {
-  dwc2_regs_t* dwc2 = DWC2_REG(rhport);
+  dwc2_regs_t *dwc2 = DWC2_REG(rhport);
 
   // Disable global interrupt
   dwc2->gahbcfg &= ~GAHBCFG_GINT;
@@ -257,7 +306,7 @@ void dwc2_core_deinit(uint8_t rhport) {
 
   // MCU-specific PHY deinit (disable PHY power)
   const dwc2_ghwcfg2_t ghwcfg2 = {.value = dwc2->ghwcfg2};
-  const uint8_t hs_phy_type = (dwc2->gusbcfg & GUSBCFG_PHYSEL) ? GHWCFG2_HSPHY_NOT_SUPPORTED : ghwcfg2.hs_phy_type;
+  const uint8_t hs_phy_type    = (dwc2->gusbcfg & GUSBCFG_PHYSEL) ? GHWCFG2_HSPHY_NOT_SUPPORTED : ghwcfg2.hs_phy_type;
   dwc2_phy_deinit(dwc2, hs_phy_type);
 }
 
